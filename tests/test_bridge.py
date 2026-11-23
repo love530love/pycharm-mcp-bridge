@@ -14,6 +14,44 @@ def test_build_entry():
     assert entry["env"]["IJ_MCP_SERVER_PORT"] == "64462"
 
 
+def test_build_entry_sse():
+    entry = bridge.build_entry("C:/PyCharm/bin/pycharm64.exe", "H:/project", 64462, transport="sse")
+    assert entry == {"url": "http://127.0.0.1:64462/sse"}
+
+
+def test_doctor_flags_runasadmin_stdio_entry(tmp_path, monkeypatch):
+    exe = tmp_path / "pycharm64.exe"
+    exe.write_text("", encoding="utf-8")
+    project = tmp_path / "project"
+    (project / ".idea").mkdir(parents=True)
+    config_path = tmp_path / "mcp.json"
+    entry = bridge.build_entry(exe, project, port=1)
+    config_path.write_text(json.dumps({"mcpServers": {"pycharm": entry}}), encoding="utf-8")
+    monkeypatch.setattr(bridge, "runasadmin_flagged", lambda path: True)
+
+    report = bridge.doctor(project, port=1, pycharm_exe=exe, config_path=config_path)
+    statuses = {item["check"]: item["status"] for item in report["checks"]}
+    assert report["ok"] is False
+    assert statuses["runasadmin"] == "warn"
+    assert statuses["client_config"] == "error"
+
+
+def test_doctor_warns_closed_sse_endpoint(tmp_path, monkeypatch):
+    exe = tmp_path / "pycharm64.exe"
+    exe.write_text("", encoding="utf-8")
+    project = tmp_path / "project"
+    (project / ".idea").mkdir(parents=True)
+    config_path = tmp_path / "mcp.json"
+    entry = bridge.build_entry("ignored", project, port=1, transport="sse")
+    config_path.write_text(json.dumps({"mcpServers": {"pycharm": entry}}), encoding="utf-8")
+    monkeypatch.setattr(bridge, "runasadmin_flagged", lambda path: False)
+
+    report = bridge.doctor(project, port=1, pycharm_exe=exe, config_path=config_path)
+    statuses = {item["check"]: item["status"] for item in report["checks"]}
+    assert report["ok"] is True
+    assert statuses["client_config"] == "warn"
+
+
 def test_merge_entry_add_unchanged_and_conflict():
     entry = bridge.build_entry("C:/PyCharm/pycharm64.exe", "H:/project")
     config, action = bridge.merge_entry({"mcpServers": {}}, entry)

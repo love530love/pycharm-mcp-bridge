@@ -24,6 +24,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
+
+__version__ = "0.2.0"
 
 SERVER_NAME = "pycharm"
 DEFAULT_PORT = 64462
@@ -38,7 +41,14 @@ class ConflictError(RuntimeError):
     pass
 
 
-def build_entry(pycharm_exe: str | Path, project: str | Path, port: int = DEFAULT_PORT) -> dict:
+def build_entry(
+    pycharm_exe: str | Path,
+    project: str | Path,
+    port: int = DEFAULT_PORT,
+    transport: str = "stdio",
+) -> dict:
+    if transport == "sse":
+        return {"url": f"http://127.0.0.1:{port}/sse"}
     return {
         "command": str(Path(pycharm_exe)),
         "args": ["stdioMcpServer"],
@@ -168,6 +178,34 @@ def port_open(host: str, port: int) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
+def runasadmin_flagged(exe: str | Path) -> bool | None:
+    if os.name != "nt":
+        return None
+    import winreg
+
+    target = str(Path(exe).resolve()).lower().replace("/", "\\")
+    for root, subkey in (
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"),
+    ):
+        try:
+            with winreg.OpenKey(root, subkey) as key:
+                index = 0
+                while True:
+                    try:
+                        name, value, _ = winreg.EnumValue(key, index)
+                    except OSError:
+                        break
+                    index += 1
+                    if name.lower().replace("/", "\\") == target:
+                        return "RUNASADMIN" in str(value).upper()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+    return False
+
+
 def _decode(raw: bytes) -> str:
     for encoding in ("utf-8", "gbk"):
         try:
@@ -220,6 +258,16 @@ def doctor(
         add("pycharm_executable", "error", f"not a file: {exe}")
     else:
         add("pycharm_executable", "ok", str(exe))
+        runas = runasadmin_flagged(exe)
+        if runas:
+            add(
+                "runasadmin",
+                "warn",
+                "this executable is flagged RUNASADMIN; a non-elevated client cannot spawn it via stdio"
+                " (WinError 740). Use --transport sse, or launch PyCharm's MCP endpoint directly.",
+            )
+        elif runas is False:
+            add("runasadmin", "ok", "no RUNASADMIN compatibility flag")
 
     if project is None:
         add("project_path", "warn", "no --project given; set IJ_MCP_SERVER_PROJECT_PATH before installing")
@@ -260,10 +308,30 @@ def doctor(
             continue
         if entry is None:
             add("client_config", "warn", f"{path}: no {SERVER_NAME} entry")
+        elif entry.get("url"):
+            parsed = urlparse(entry["url"])
+            if parsed.hostname not in ("127.0.0.1", "localhost", "::1") or not parsed.port:
+                add("client_config", "warn", f"{path}: unexpected SSE URL: {entry['url']}")
+            elif port_open(parsed.hostname, parsed.port):
+                add("client_config", "ok", str(path))
+            else:
+                add(
+                    "client_config",
+                    "warn",
+                    f"{path}: {entry['url']} is not listening; open the project in PyCharm and enable"
+                    " Settings -> Tools -> MCP Server",
+                )
         else:
             command = entry.get("command")
             if command and not Path(command).is_file():
                 add("client_config", "warn", f"{path}: command not found: {command}")
+            elif command and runasadmin_flagged(command):
+                add(
+                    "client_config",
+                    "error",
+                    f"{path}: stdio entry spawns {command}, which is RUNASADMIN-flagged; non-elevated"
+                    " clients fail with WinError 740. Reinstall with --transport sse.",
+                )
             else:
                 add("client_config", "ok", str(path))
 
@@ -289,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="pycharm-mcp-bridge",
         description="Configure and diagnose PyCharm's built-in MCP server.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("detect", help="Find installed PyCharm executables")
@@ -297,12 +366,24 @@ def main(argv: list[str] | None = None) -> int:
     print_config.add_argument("--project", required=True, help="PyCharm project path")
     print_config.add_argument("--port", type=int, default=DEFAULT_PORT)
     print_config.add_argument("--pycharm-exe", help="PyCharm executable path")
+    print_config.add_argument(
+        "--transport",
+        choices=["stdio", "sse"],
+        default="stdio",
+        help="stdio spawns the IDE executable; sse connects to the IDE web server (recommended when the exe is RUNASADMIN-flagged)",
+    )
 
     installer = subparsers.add_parser("install", help="Merge the entry into a client config")
     installer.add_argument("--client", choices=[*CLIENT_CONFIGS, "all"], required=True)
     installer.add_argument("--project", required=True, help="PyCharm project path")
     installer.add_argument("--port", type=int, default=DEFAULT_PORT)
     installer.add_argument("--pycharm-exe", help="PyCharm executable path")
+    installer.add_argument(
+        "--transport",
+        choices=["stdio", "sse"],
+        default="stdio",
+        help="stdio spawns the IDE executable; sse connects to the IDE web server",
+    )
     installer.add_argument("--config", help="Explicit mcp.json path (overrides --client target)")
     installer.add_argument("--force", action="store_true", help="Replace an existing entry")
     installer.add_argument("--dry-run", action="store_true", help="Show the result without writing")
@@ -320,12 +401,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "print-config":
-        entry = build_entry(_resolve_exe(args.pycharm_exe), args.project, args.port)
+        exe = _resolve_exe(args.pycharm_exe) if args.transport == "stdio" else args.pycharm_exe or ""
+        entry = build_entry(exe, args.project, args.port, args.transport)
         _print_json({"mcpServers": {SERVER_NAME: entry}})
         return 0
 
     if args.command == "install":
-        entry = build_entry(_resolve_exe(args.pycharm_exe), args.project, args.port)
+        exe = _resolve_exe(args.pycharm_exe) if args.transport == "stdio" else args.pycharm_exe or ""
+        entry = build_entry(exe, args.project, args.port, args.transport)
         clients = list(CLIENT_CONFIGS) if args.client == "all" else [args.client]
         results = []
         for client in clients:
